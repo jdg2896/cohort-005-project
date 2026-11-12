@@ -9,6 +9,7 @@ import {
   LayoutDashboard,
   GraduationCap,
   MessageSquare,
+  ReceiptText,
   Shield,
   Tag,
   Users,
@@ -40,6 +41,7 @@ interface SidebarProps {
   currentUser: CurrentUser | null;
   recentCourses?: RecentCourse[];
   isTeamAdmin?: boolean;
+  pendingRefundRequestCount?: number;
 }
 
 interface NavItem {
@@ -47,6 +49,7 @@ interface NavItem {
   to: string;
   icon: React.ReactNode;
   roles: UserRole[] | "all";
+  badge?: "pendingRefundRequests";
 }
 
 const navItems: NavItem[] = [
@@ -98,6 +101,13 @@ const navItems: NavItem[] = [
     icon: <Tag className="size-4" />,
     roles: [UserRole.Admin],
   },
+  {
+    label: "Refund Requests",
+    to: "/admin/refunds",
+    icon: <ReceiptText className="size-4" />,
+    roles: [UserRole.Admin],
+    badge: "pendingRefundRequests",
+  },
 ];
 
 function isVisible(item: NavItem, role: UserRole | null): boolean {
@@ -110,6 +120,7 @@ export function Sidebar({
   currentUser,
   recentCourses = [],
   isTeamAdmin = false,
+  pendingRefundRequestCount = 0,
 }: SidebarProps) {
   const currentUserRole = currentUser?.role ?? null;
   const [isDark, setIsDark] = useState(false);
@@ -153,6 +164,15 @@ export function Sidebar({
             >
               {item.icon}
               {item.label}
+              {item.badge === "pendingRefundRequests" &&
+                pendingRefundRequestCount > 0 && (
+                  <span
+                    className="ml-auto rounded-full bg-primary px-2 py-0.5 text-xs font-semibold text-primary-foreground"
+                    aria-label={`${pendingRefundRequestCount} pending`}
+                  >
+                    {pendingRefundRequestCount}
+                  </span>
+                )}
             </NavLink>
           ))}
         {isTeamAdmin && (

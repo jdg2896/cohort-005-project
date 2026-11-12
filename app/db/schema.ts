@@ -242,6 +242,11 @@ export const refunds = sqliteTable(
       .default(RefundStatus.Requested),
     // The learner's own words, in the box on the course page.
     reason: text("reason").notNull(),
+    // The Quoted Refund Amount: what the learner was told, in cents, when
+    // they asked. An Approval refunds exactly this.
+    quotedAmount: integer("quoted_amount").notNull(),
+    // The Admin's Decline Note. Set only on a Decline.
+    declineNote: text("decline_note"),
     // Null until someone approves — a declined request refunds nothing.
     amountRefunded: integer("amount_refunded"),
     requestedAt: text("requested_at")

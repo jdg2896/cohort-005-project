@@ -1,7 +1,20 @@
-import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/sqlite-core";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  inArray,
+  isNotNull,
+  isNull,
+  ne,
+  sql,
+} from "drizzle-orm";
 import { db } from "~/db";
 import {
+  courses,
   coupons,
+  enrollments,
   lessonProgress,
   lessons,
   modules,
@@ -10,6 +23,7 @@ import {
   videoWatchEvents,
   LessonProgressStatus,
   RefundStatus,
+  users,
 } from "~/db/schema";
 import { getDiscountForCountry } from "~/lib/ppp";
 
@@ -35,18 +49,21 @@ function getLatestPurchase(userId: number, courseId: number) {
     .get();
 }
 
-function getPendingRefundRequest(purchaseId: number) {
+function getEarlierRefundRequest(purchaseId: number) {
   return db
-    .select({ id: refunds.id })
+    .select({ status: refunds.status })
     .from(refunds)
-    .where(
-      and(
-        eq(refunds.purchaseId, purchaseId),
-        eq(refunds.status, RefundStatus.Requested)
-      )
-    )
+    .where(eq(refunds.purchaseId, purchaseId))
     .get();
 }
+
+const EARLIER_REFUND_REQUEST_REASONS: Record<RefundStatus, string> = {
+  [RefundStatus.Requested]:
+    "You already have a Refund Request pending for this purchase.",
+  [RefundStatus.Approved]: "This purchase has already been refunded.",
+  [RefundStatus.Declined]:
+    "Your Refund Request for this purchase was declined.",
+};
 
 function getLessonIdsForCourse(courseId: number): number[] {
   return db
@@ -124,10 +141,14 @@ export function getRefundEligibility(
     };
   }
 
-  if (getPendingRefundRequest(purchase.id)) {
+  // A Purchase gets one Refund Request. Once it is decided, either way, the
+  // decision is final.
+  const earlierRequest = getEarlierRefundRequest(purchase.id);
+
+  if (earlierRequest) {
     return {
       eligible: false,
-      reason: "You already have a Refund Request pending for this purchase.",
+      reason: EARLIER_REFUND_REQUEST_REASONS[earlierRequest.status],
       status: 409,
     };
   }
@@ -192,4 +213,255 @@ export function getRefundEligibility(
   const amount = pppDiscount > 0 ? purchase.amountPaid : course.price;
 
   return { eligible: true, purchase, amount, lastDayInRefundWindow };
+}
+
+// ─── Deciding a Refund Request ───
+
+export type RefundDecisionRefused = {
+  ok: false;
+  reason: string;
+  status: 400 | 403 | 404 | 409;
+};
+
+export type ApprovalResult =
+  { ok: true; amountRefunded: number } | RefundDecisionRefused;
+
+export type DeclineResult = { ok: true } | RefundDecisionRefused;
+
+const ALREADY_DECIDED = {
+  ok: false,
+  reason: "This Refund Request has already been decided.",
+  status: 409,
+} as const;
+
+function findRefundRequestWithPurchase(refundRequestId: number) {
+  const row = db
+    .select({ request: refunds, purchase: purchases })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .where(eq(refunds.id, refundRequestId))
+    .get();
+  return row ?? null;
+}
+
+/**
+ * The Refund Request, if this Admin may decide it. An Admin never decides
+ * their own.
+ */
+function findDecidableRefundRequest(
+  refundRequestId: number,
+  adminId: number
+):
+  | ({ ok: true } & NonNullable<
+      ReturnType<typeof findRefundRequestWithPurchase>
+    >)
+  | RefundDecisionRefused {
+  const found = findRefundRequestWithPurchase(refundRequestId);
+
+  if (!found) {
+    return { ok: false, reason: "Refund Request not found.", status: 404 };
+  }
+
+  if (found.purchase.userId === adminId) {
+    return {
+      ok: false,
+      reason: "Another Admin must decide your own Refund Request.",
+      status: 403,
+    };
+  }
+
+  return { ok: true, ...found };
+}
+
+/**
+ * An Admin's Approval of a pending Refund Request: refunds exactly the Quoted
+ * Refund Amount.
+ */
+export function approveRefundRequest(
+  refundRequestId: number,
+  adminId: number
+): ApprovalResult {
+  const found = findDecidableRefundRequest(refundRequestId, adminId);
+
+  if (!found.ok) {
+    return found;
+  }
+
+  const { request, purchase } = found;
+
+  // Only a still-pending request is updated, so when two Admins decide at
+  // once the first decision wins and the second changes nothing.
+  const { changes } = db
+    .update(refunds)
+    .set({
+      status: RefundStatus.Approved,
+      amountRefunded: request.quotedAmount,
+      resolvedAt: new Date().toISOString(),
+      resolvedByUserId: adminId,
+    })
+    .where(
+      and(
+        eq(refunds.id, refundRequestId),
+        eq(refunds.status, RefundStatus.Requested)
+      )
+    )
+    .run();
+
+  if (changes === 0) {
+    return ALREADY_DECIDED;
+  }
+
+  // A team Purchase pays for seats, not for the buyer's own access. Claimed
+  // seats make a Purchase ineligible, so only unclaimed ones can be left; they
+  // are cancelled so nobody can redeem a refunded seat.
+  const isTeamPurchase = !!db
+    .select({ id: coupons.id })
+    .from(coupons)
+    .where(eq(coupons.purchaseId, purchase.id))
+    .get();
+
+  if (isTeamPurchase) {
+    db.delete(coupons)
+      .where(
+        and(eq(coupons.purchaseId, purchase.id), isNull(coupons.redeemedAt))
+      )
+      .run();
+  } else {
+    db.delete(enrollments)
+      .where(
+        and(
+          eq(enrollments.userId, purchase.userId),
+          eq(enrollments.courseId, purchase.courseId)
+        )
+      )
+      .run();
+  }
+
+  return { ok: true, amountRefunded: request.quotedAmount };
+}
+
+/**
+ * An Admin's Decline of a pending Refund Request. Nothing is refunded and the
+ * learner keeps their access; the Decline Note says why.
+ */
+export function declineRefundRequest(
+  refundRequestId: number,
+  adminId: number,
+  declineNote: string
+): DeclineResult {
+  const note = declineNote.trim();
+
+  if (!note) {
+    return {
+      ok: false,
+      reason: "Write a Decline Note telling the learner why.",
+      status: 400,
+    };
+  }
+
+  const found = findDecidableRefundRequest(refundRequestId, adminId);
+
+  if (!found.ok) {
+    return found;
+  }
+
+  const { changes } = db
+    .update(refunds)
+    .set({
+      status: RefundStatus.Declined,
+      declineNote: note,
+      resolvedAt: new Date().toISOString(),
+      resolvedByUserId: adminId,
+    })
+    .where(
+      and(
+        eq(refunds.id, refundRequestId),
+        eq(refunds.status, RefundStatus.Requested)
+      )
+    )
+    .run();
+
+  if (changes === 0) {
+    return ALREADY_DECIDED;
+  }
+
+  return { ok: true };
+}
+
+// ─── The Refund Request queue ───
+
+const learners = alias(users, "learners");
+const deciders = alias(users, "deciders");
+
+function refundRequestRows() {
+  return db
+    .select({
+      id: refunds.id,
+      status: refunds.status,
+      reason: refunds.reason,
+      quotedAmount: refunds.quotedAmount,
+      amountRefunded: refunds.amountRefunded,
+      declineNote: refunds.declineNote,
+      requestedAt: refunds.requestedAt,
+      resolvedAt: refunds.resolvedAt,
+      learnerId: learners.id,
+      learnerName: learners.name,
+      learnerEmail: learners.email,
+      courseId: courses.id,
+      courseTitle: courses.title,
+      courseSlug: courses.slug,
+      purchasedAt: purchases.createdAt,
+      amountPaid: purchases.amountPaid,
+      decidedByName: deciders.name,
+    })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .innerJoin(learners, eq(purchases.userId, learners.id))
+    .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .leftJoin(deciders, eq(refunds.resolvedByUserId, deciders.id));
+}
+
+/**
+ * Everything an Admin needs to decide: pending Refund Requests, oldest first,
+ * each with how much of the course the learner has used *now* — context for
+ * the decision, not a rule — and the most recent decisions as an audit trail.
+ */
+export function getRefundRequestQueue(recentLimit = 20) {
+  const pending = refundRequestRows()
+    .where(eq(refunds.status, RefundStatus.Requested))
+    .orderBy(asc(refunds.requestedAt))
+    .all()
+    .map((row) => {
+      const lessonIds = getLessonIdsForCourse(row.courseId);
+      return {
+        ...row,
+        secondsWatched: getSecondsWatched(row.learnerId, lessonIds),
+        lessonsCompleted: getCompletedLessonCount(row.learnerId, lessonIds),
+        lessonCount: lessonIds.length,
+      };
+    });
+
+  const recentlyDecided = refundRequestRows()
+    .where(ne(refunds.status, RefundStatus.Requested))
+    .orderBy(desc(refunds.resolvedAt))
+    .limit(recentLimit)
+    .all();
+
+  return { pending, recentlyDecided };
+}
+
+export function countPendingRefundRequests() {
+  const row = db
+    .select({ count: sql<number>`count(*)` })
+    .from(refunds)
+    .where(eq(refunds.status, RefundStatus.Requested))
+    .get();
+  return row?.count ?? 0;
+}
+
+/** Who to tell about a decision, and about which course. */
+export function getRefundRequestRecipient(refundRequestId: number) {
+  return (
+    refundRequestRows().where(eq(refunds.id, refundRequestId)).get() ?? null
+  );
 }

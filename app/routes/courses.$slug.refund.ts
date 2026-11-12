@@ -89,6 +89,7 @@ export async function action({ params, request }: Route.ActionArgs) {
       purchaseId: eligibility.purchase.id,
       status: RefundStatus.Requested,
       reason: parsed.data.reason,
+      quotedAmount: eligibility.amount,
     })
     .run();
 
