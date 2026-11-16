@@ -50,21 +50,15 @@ describe("noteDraftStatus", () => {
   });
 
   it("allows a note of exactly the maximum length", () => {
-    const status = noteDraftStatus("a".repeat(10), null, 10);
+    const status = noteDraftStatus("a".repeat(MAX_NOTE_LENGTH), null);
     expect(status.tooLong).toBe(false);
     expect(status.canSave).toBe(true);
   });
 
   it("refuses a note one character over the maximum", () => {
-    const status = noteDraftStatus("a".repeat(11), null, 10);
+    const status = noteDraftStatus("a".repeat(MAX_NOTE_LENGTH + 1), null);
     expect(status.tooLong).toBe(true);
     expect(status.canSave).toBe(false);
-    expect(status.maxLength).toBe(10);
-  });
-
-  it("uses MAX_NOTE_LENGTH by default", () => {
-    expect(noteDraftStatus("a".repeat(MAX_NOTE_LENGTH + 1), null).tooLong).toBe(
-      true
-    );
+    expect(status.maxLength).toBe(MAX_NOTE_LENGTH);
   });
 });

@@ -11,8 +11,7 @@ export type { NoteDraftStatus };
  */
 export function noteDraftStatus(
   draft: string,
-  savedBody: string | null,
-  maxLength: number = MAX_NOTE_LENGTH
+  savedBody: string | null
 ): NoteDraftStatus {
-  return describeDraft(draft, savedBody, maxLength);
+  return describeDraft(draft, savedBody, MAX_NOTE_LENGTH);
 }
